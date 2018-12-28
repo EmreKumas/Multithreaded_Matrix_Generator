@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <time.h>
 #include <math.h>
 #include <stdbool.h>
@@ -19,40 +20,37 @@ typedef struct{
 
 }Matrix;
 
-typedef struct{
-
-    Matrix *front;
-    int front_index;
-    Matrix *rear;
-    int rear_index;
-    int size;
-    Matrix **elements;
-
-}Queue_Struct;
-
 //Global variables.
+int **main_matrix = NULL;
 int matrix_size;
 
 int index_of_the_matrix_to_generate = 0;
 int submatrix_needed;
 int extra_matrix_needed;
+int extra_log_needed;
 
-Queue_Struct *first_queue = NULL;
-Queue_Struct *second_queue = NULL;
+Matrix **first_queue = NULL;
+Matrix **second_queue = NULL;
+
+int first_queue_push_index = 0;
+int queue_log_index = 0;
 
 //Mutex and Semaphores
 pthread_mutex_t generate_mutex;
+pthread_mutex_t log_mutex;
+pthread_mutex_t write_to_screen_mutex;
+
+sem_t generated_matrix_semaphore;
 
 //Function declarations.
-void enqueue(Queue_Struct *, Matrix *);
-void freeQueue(Queue_Struct *);
 void *Generate_Thread(void *);
+void *Log_Thread(void *);
 
-bool queue_isFull(Queue_Struct *);
-bool queue_isEmpty(Queue_Struct *);
+void enqueue(Matrix **, int *, Matrix *);
+void freeQueue(Matrix **, int);
 
-Queue_Struct *createQueue();
-Matrix *dequeue(Queue_Struct *);
+Matrix **createQueue();
+Matrix *getFromQueue(Matrix **, int *);
 
 int main(int argc, char *argv[]){
 
@@ -85,6 +83,9 @@ int main(int argc, char *argv[]){
     if(submatrix_needed > generate_thread_count)
         extra_matrix_needed = submatrix_needed - generate_thread_count;
 
+    if(submatrix_needed > log_thread_count)
+        extra_log_needed = submatrix_needed - log_thread_count;
+
     pthread_t generate_thread_ids[generate_thread_count];
     pthread_t log_thread_ids[log_thread_count];
     pthread_t mod_thread_ids[mod_thread_count];
@@ -92,6 +93,10 @@ int main(int argc, char *argv[]){
 
     //Initializing mutex and semaphores.
     pthread_mutex_init(&generate_mutex, NULL);
+    pthread_mutex_init(&log_mutex, NULL);
+    pthread_mutex_init(&write_to_screen_mutex, NULL);
+
+    sem_init(&generated_matrix_semaphore, 0, 0);
 
     //Creating generate threads.
     for(loop_index = 0; loop_index < generate_thread_count; loop_index++){
@@ -99,7 +104,18 @@ int main(int argc, char *argv[]){
         thread_control = pthread_create(&generate_thread_ids[loop_index], NULL, &Generate_Thread, (void *) loop_index);
 
         if(thread_control){
-            fprintf(stderr, "Error: return code from creating thread is %d\n", thread_control);
+            fprintf(stderr, "Error: return code from creating generate thread is %d\n", thread_control);
+            exit(-1);
+        }
+    }
+
+    //Creating log threads.
+    for(loop_index = 0; loop_index < log_thread_count; loop_index++){
+
+        thread_control = pthread_create(&log_thread_ids[loop_index], NULL, &Log_Thread, (void *) loop_index);
+
+        if(thread_control){
+            fprintf(stderr, "Error: return code from creating log thread is %d\n", thread_control);
             exit(-1);
         }
     }
@@ -110,7 +126,18 @@ int main(int argc, char *argv[]){
         thread_control = pthread_join(generate_thread_ids[loop_index], NULL);
 
         if(thread_control){
-            fprintf(stderr, "Error: return code from joining the thread is %d\n", thread_control);
+            fprintf(stderr, "Error: return code from joining the generate thread is %d\n", thread_control);
+            exit(-1);
+        }
+    }
+
+    //Joining log threads.
+    for(loop_index = 0; loop_index < log_thread_count; loop_index++){
+
+        thread_control = pthread_join(log_thread_ids[loop_index], NULL);
+
+        if(thread_control){
+            fprintf(stderr, "Error: return code from joining the log thread is %d\n", thread_control);
             exit(-1);
         }
     }
@@ -119,9 +146,42 @@ int main(int argc, char *argv[]){
 
     //Destroying mutex and semaphores.
     pthread_mutex_destroy(&generate_mutex);
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&write_to_screen_mutex);
+
+    sem_destroy(&generated_matrix_semaphore);
+
+    //Printing the results...
+    int i, j;
+
+    printf("\nThe matrix is\n");
+    for(i = 0; i < matrix_size; i++){
+
+        if(i == 0) printf("\t[");
+
+        for(j = 0; j < matrix_size; j++){
+
+            printf("%d", main_matrix[i][j]);
+
+            if(i == matrix_size - 1 && j == matrix_size - 1)
+                printf("]");
+            else
+                printf(",");
+        }
+
+        if(i != matrix_size - 1)
+            printf("\n\t");
+        else
+            printf("\n\n");
+    }
+
+    //Free the main matrix.
+    for(i = 0; i < matrix_size; i++)
+        free(main_matrix[i]);
+    free(main_matrix);
 
     //Freeing the queues.
-    freeQueue(first_queue);
+    freeQueue(first_queue, first_queue_push_index);
 
     pthread_exit(NULL);
 }
@@ -157,11 +217,11 @@ void *Generate_Thread(void *argument){
     if(first_queue == NULL)
         first_queue = createQueue();
 
-    enqueue(first_queue, matrix);
+    enqueue(first_queue, &first_queue_push_index, matrix);
     pthread_mutex_unlock(&generate_mutex);
 
     //For printing the job...
-    pthread_mutex_lock(&generate_mutex);
+    pthread_mutex_lock(&write_to_screen_mutex);
 
     printf("Generator_%d\tGenerator_%d generated following matrix:[", (generate_thread_index + 1), (generate_thread_index + 1));
     for(i = 0; i < 5; i++){
@@ -180,7 +240,10 @@ void *Generate_Thread(void *argument){
     }
     printf("\t\tThis matrix is [%d,%d] submatrix.\n\n", matrix->global_row_index, matrix->global_column_index);
 
-    pthread_mutex_unlock(&generate_mutex);
+    pthread_mutex_unlock(&write_to_screen_mutex);
+
+    //Incrementing the semaphore.
+    sem_post(&generated_matrix_semaphore);
 
     //Now, we will check if extra matrix is needed.
     bool while_condition = true;
@@ -219,11 +282,11 @@ void *Generate_Thread(void *argument){
 
             //After creating the matrix, we will push the matrix into the queue.
             pthread_mutex_lock(&generate_mutex);
-            enqueue(first_queue, extra_matrix);
+            enqueue(first_queue, &first_queue_push_index, extra_matrix);
             pthread_mutex_unlock(&generate_mutex);
 
             //And again, print the results.
-            pthread_mutex_lock(&generate_mutex);
+            pthread_mutex_lock(&write_to_screen_mutex);
 
             printf("Generator_%d\tGenerator_%d generated following matrix:[", (generate_thread_index + 1), (generate_thread_index + 1));
             for(i = 0; i < 5; i++){
@@ -242,7 +305,10 @@ void *Generate_Thread(void *argument){
             }
             printf("\t\tThis matrix is [%d,%d] submatrix.\n\n", extra_matrix->global_row_index, extra_matrix->global_column_index);
 
-            pthread_mutex_unlock(&generate_mutex);
+            pthread_mutex_unlock(&write_to_screen_mutex);
+
+            //Incrementing the semaphore.
+            sem_post(&generated_matrix_semaphore);
 
             generate_another_matrix = false;
         }
@@ -251,77 +317,130 @@ void *Generate_Thread(void *argument){
     pthread_exit(NULL);
 }
 
-Queue_Struct *createQueue(){
+void *Log_Thread(void *argument){
 
-    Queue_Struct *queue;
+    int log_thread_index = (int) argument;
+    int i, j, k, l;
+    Matrix *matrix;
 
-    queue = malloc(sizeof(Queue_Struct));
-    queue->front = NULL;
-    queue->rear = NULL;
-    queue->size = 0;
-    queue->front_index = 0;
-    queue->rear_index = 0;
-    queue->elements = malloc(submatrix_needed * sizeof(Matrix *));
+    pthread_mutex_lock(&log_mutex);
 
-    return queue;
-}
+    if(main_matrix == NULL){
 
-bool queue_isFull(Queue_Struct *queue){
+        main_matrix = malloc(matrix_size * sizeof(int *));
 
-    return (submatrix_needed == queue->size);
-}
-
-bool queue_isEmpty(Queue_Struct *queue){
-
-    return (0 == queue->size);
-}
-
-void enqueue(Queue_Struct *queue, Matrix *matrix){
-
-    if(queue_isFull(queue)){
-        fprintf(stderr, "Something went wrong, the queue shouldn't be full!!!\n");
-        exit(-1);
+        for(i = 0; i < matrix_size; i++)
+            main_matrix[i] = malloc(matrix_size * sizeof(int));
     }
 
-    if(queue->size == 0){
-        queue->front_index = 0;
-        queue->rear_index = 0;
-    }else
-        queue->rear_index++;
+    pthread_mutex_unlock(&log_mutex);
 
-    queue->elements[queue->rear_index] = matrix;
-    queue->rear = matrix;
+    //Waiting for a matrix to be enqueued.
+    sem_wait(&generated_matrix_semaphore);
 
-    if(queue->front_index == 0) queue->front = matrix;
+    //Getting the matrix.
+    pthread_mutex_lock(&log_mutex);
+    matrix = getFromQueue(first_queue, &queue_log_index);
+    pthread_mutex_unlock(&log_mutex);
 
-    queue->size++;
-}
+    //Now, we need to add it to the global matrix.
+    for(i = matrix->global_row_index * 5, k = 0; k < 5; i++, k++){
+        for(j = matrix->global_column_index * 5, l = 0; l < 5; j++, l++){
 
-Matrix *dequeue(Queue_Struct *queue){
-
-    if(queue_isEmpty(queue)){
-        fprintf(stderr, "Something went wrong, the queue shouldn't be empty!!!\n");
-        exit(-1);
+            main_matrix[i][j] = matrix->matrix[k][l];
+        }
     }
 
-    Matrix *to_dequeue = queue->front;
-    queue->front_index++;
-    queue->front = queue->elements[queue->front_index];
+    //For printing the job...
+    pthread_mutex_lock(&write_to_screen_mutex);
 
-    queue->size--;
+    printf("Log_%d\t\tLog_%d joined the matrix.\n", (log_thread_index + 1), (log_thread_index + 1));
+    printf("\t\tThe matrix joined is [%d,%d] submatrix.\n\n", matrix->global_row_index, matrix->global_column_index);
+
+    pthread_mutex_unlock(&write_to_screen_mutex);
+
+    //Now, we will check if extra log is needed.
+    bool while_condition = true;
+    bool another_log_needed = false;
+
+    while(while_condition == true){
+
+        pthread_mutex_lock(&log_mutex);
+
+        if(extra_log_needed == 0)
+            while_condition = false;
+        else{
+            another_log_needed = true;
+            extra_log_needed--;
+        }
+
+        pthread_mutex_unlock(&log_mutex);
+
+        if(another_log_needed == true){
+
+            Matrix *another_matrix;
+
+            //Waiting for a matrix to be enqueued.
+            sem_wait(&generated_matrix_semaphore);
+
+            //Getting the matrix.
+            pthread_mutex_lock(&log_mutex);
+            another_matrix = getFromQueue(first_queue, &queue_log_index);
+            pthread_mutex_unlock(&log_mutex);
+
+            //Now, we need to add it to the global matrix.
+            for(i = another_matrix->global_row_index * 5, k = 0; k < 5; i++, k++){
+                for(j = another_matrix->global_column_index * 5, l = 0; l < 5; j++, l++){
+
+                    main_matrix[i][j] = another_matrix->matrix[k][l];
+                }
+            }
+
+            //For printing the job...
+            pthread_mutex_lock(&write_to_screen_mutex);
+
+            printf("Log_%d\t\tLog_%d joined the matrix.\n", (log_thread_index + 1), (log_thread_index + 1));
+            printf("\t\tThe matrix joined is [%d,%d] submatrix.\n\n", another_matrix->global_row_index, another_matrix->global_column_index);
+
+            pthread_mutex_unlock(&write_to_screen_mutex);
+
+            another_log_needed = false;
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+Matrix **createQueue(){
+
+    Matrix **matrix;
+
+    matrix = malloc(submatrix_needed * sizeof(Matrix *));
+
+    return matrix;
+}
+
+void enqueue(Matrix **queue, int *queue_push_index, Matrix *matrix){
+
+    queue[*queue_push_index] = matrix;
+
+    *queue_push_index = *queue_push_index + 1;
+}
+
+Matrix *getFromQueue(Matrix **queue, int *queue_log_index){
+
+    Matrix *to_dequeue = queue[*queue_log_index];
+    *queue_log_index = *queue_log_index + 1;
 
     return to_dequeue;
 }
 
-void freeQueue(Queue_Struct *queue){
+void freeQueue(Matrix **queue, int queue_push_index){
 
-    int i = queue->size;
+    int i;
 
-    for( ; i > 0; i--){
+    for(i = 0; i < queue_push_index; i++)
+        free(queue[i]);
 
-        free(queue->elements[i - 1]);
-    }
-
-    free(queue->elements);
     free(queue);
 }
